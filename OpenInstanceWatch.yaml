@@ -1,0 +1,272 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'CloudFormation template for OpenInstanceWatch including EC2 and RDS instances (Version 1.0, ARM64)'
+
+Parameters:
+  EmailAddress:
+    Type: String
+    Description: Email address to receive notifications
+    AllowedPattern: '^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    ConstraintDescription: Must be a valid email address
+
+  HourToRun:
+    Type: Number
+    Default: 3
+    Description: Hour of the day to run the function (0-23, UTC)
+    MinValue: 0
+    MaxValue: 23
+    ConstraintDescription: Must be a number between 0 and 23
+
+  MinutePastHour:
+    Type: Number
+    Default: 14
+    Description: Minute past the hour to run the function (0-59)
+    MinValue: 0
+    MaxValue: 59
+    ConstraintDescription: Must be a number between 0 and 59
+
+Resources:
+  SNSTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${AWS::StackName}-DailyReportTopic'
+      Subscription:
+        - Protocol: email
+          Endpoint: !Ref EmailAddress
+      Tags:
+        - Key: 'Name'
+          Value: !Sub '${AWS::StackName}-DailyReportTopic'
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: !Sub '${AWS::StackName}-AccessPolicy'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeRegions
+                  - ec2:DescribeInstances
+                  - rds:DescribeDBInstances
+                Resource: '*'
+              - Effect: Allow
+                Action: sns:Publish
+                Resource: !Ref SNSTopic
+      Tags:
+        - Key: 'Name'
+          Value: !Sub '${AWS::StackName}-LambdaExecutionRole'
+
+  LambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-DailyReportFunction'
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: python3.13
+      Architectures:
+        - arm64
+      MemorySize: 256
+      Timeout: 300
+      Environment:
+        Variables:
+          SNS_TOPIC_ARN: !Ref SNSTopic
+          LOG_LEVEL: INFO
+      Tags:
+        - Key: 'Name'
+          Value: !Sub '${AWS::StackName}-LambdaFunction'
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import os
+          import logging
+          from concurrent.futures import ThreadPoolExecutor
+          from typing import Dict, List, Any
+          from datetime import datetime, timezone
+          
+          # Configure logging
+          logger = logging.getLogger()
+          logger.setLevel(os.environ.get('LOG_LEVEL', 'INFO'))
+          
+          # Create AWS SDK clients outside the handler function
+          ec2_client = boto3.client('ec2')
+          sns_client = boto3.client('sns')
+
+          # Get EC2 and RDS instances for a specific region
+          def get_instances_for_region(region: str) -> Dict[str, List[Dict[str, Any]]]:
+              """Get EC2 and RDS instances for a specific region."""
+              try:
+                  # Create the service clients
+                  ec2 = boto3.client('ec2', region_name=region)
+                  rds = boto3.client('rds', region_name=region)
+          
+                  region_data = {'EC2': [ ], 'RDS': [ ] }
+          
+                  # Get EC2 instances
+                  paginator = ec2.get_paginator('describe_instances')
+                  for page in paginator.paginate():
+                      for reservation in page['Reservations']:
+                          for instance in reservation['Instances']:
+                              region_data['EC2'].append({
+                                  'Region': region,
+                                  'InstanceId': instance['InstanceId'],
+                                  'InstanceType': instance['InstanceType'],
+                                  'State': instance['State']['Name']
+                              })
+          
+                  # Get RDS instances
+                  paginator = rds.get_paginator('describe_db_instances')
+                  for page in paginator.paginate():
+                      for instance in page['DBInstances']:
+                          region_data['RDS'].append({
+                            'Region': region,
+                            'DBInstanceIdentifier': instance['DBInstanceIdentifier'],
+                            'Engine': instance['Engine'],
+                            'DBInstanceClass': instance['DBInstanceClass'],
+                            'DBInstanceStatus': instance['DBInstanceStatus']
+                          })
+          
+                  return region_data
+              except Exception as e:
+                  logger.error(f"Error processing region {region}: { str(e) }")
+                  return {'EC2': [], 'RDS': []}
+          
+          # JSON to Markdown Table
+          def instances_to_markdown_table(instances):
+              if not instances:
+                  return "No instances found."
+          
+              # Extract headers from the first instance
+              headers = list(instances[0].keys())
+          
+              # Calculate the maximum width for each column
+              col_widths = {header: len(header) for header in headers}
+              for instance in instances:
+                  for header in headers:
+                    col_widths[header] = max(col_widths[header], len(str(instance.get(header, ""))))
+          
+              # Add padding to match the longest column value
+              for header in headers:
+                  col_widths[header] += 2  # Add padding
+              # max_width = max(col_widths.values())
+              # col_widths = {header: max_width for header in headers}
+          
+              # Create the table header
+              markdown = "| " + " | ".join(header.center(col_widths[header]) for header in headers) + " |\n"
+              markdown += "| " + " | ".join("-" * col_widths[header] for header in headers) + " |\n"
+          
+              # Add rows to the table
+              for instance in instances:
+                  row = "| " + " | ".join(str(instance.get(header, "")).center(col_widths[header]) for header in headers) + " |"
+                  markdown += row + "\n"
+          
+              return markdown
+          
+          # Lambda Handler
+          def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
+              try:
+                  # Get all regions
+                  regions = [region['RegionName'] for region in ec2_client.describe_regions()['Regions']]
+          
+                  # Process regions in parallel
+                  instance_data = {'EC2': [ ], 'RDS': [ ] }
+                  with ThreadPoolExecutor(max_workers=10) as executor:
+                      results = list(executor.map(get_instances_for_region, regions))
+          
+                      for result in results:
+                        instance_data['EC2'].extend(result['EC2'])
+                        instance_data['RDS'].extend(result['RDS'])
+          
+                  # Add summary information
+                  instance_summary = [{
+                      'Total EC2': len(instance_data['EC2']),
+                      'Total RDS': len(instance_data['RDS']),
+                      'Regions Scanned': len(regions)
+                  }]
+          
+                  # Convert the data to a text message
+                  message = ("Summary\n"
+                            + instances_to_markdown_table(instance_summary)
+                            + "\n\nEC2 Instances\n"
+                            + instances_to_markdown_table(instance_data['EC2'])
+                            + "\n\nRDS Instances\n"
+                            + instances_to_markdown_table(instance_data['RDS'])
+                            )
+          
+                  # Get the AWS account ID
+                  accountid = context.invoked_function_arn.split(":")[4]
+          
+                  # Current date as YYYY-MM-DD
+                  current_date = datetime.now(timezone.utc).strftime('%Y-%m-%d')
+          
+                  # Publish to SNS
+                  sns_client.publish(
+                      TopicArn=os.environ['SNS_TOPIC_ARN'],
+                      Subject=current_date + ' OpenInstanceWatch Daily Report for AWS Account ' + accountid,
+                      Message=message
+                  )
+          
+                  logger.info(f"Report generated and sent successfully")
+                  return {
+                    'statusCode': 200,
+                    'body': 'Report generated and sent successfully'
+                  }
+              except Exception as e:
+                  logger.error(f"Error in handler: { str(e) }")
+                  return {
+                      'statusCode': 500,
+                      'body': 'An error occurred'
+                  }
+
+  LambdaVersion:
+    Type: AWS::Lambda::Version
+    Properties:
+      FunctionName: !Ref LambdaFunction
+      Description: 'Version 1.5.1'
+
+  LambdaAlias:
+    Type: AWS::Lambda::Alias
+    Properties:
+      FunctionName: !Ref LambdaFunction
+      FunctionVersion: !GetAtt LambdaVersion.Version
+      Name: 'latest'
+      Description: 'Alias to the latest version'
+
+  ScheduledRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: "Scheduled execution of OpenInstanceWatch"
+      ScheduleExpression: !Sub "cron(${MinutePastHour} ${HourToRun} * * ? *)"
+      State: "ENABLED"
+      Targets:
+        - Arn: !GetAtt LambdaFunction.Arn
+          Id: "DailyReportSchedule"
+
+  LambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref LambdaFunction
+      Action: "lambda:InvokeFunction"
+      Principal: "events.amazonaws.com"
+      SourceArn: !GetAtt ScheduledRule.Arn
+
+Outputs:
+  SNSTopicArn:
+    Description: "ARN of the SNS Topic"
+    Value: !Ref SNSTopic
+  LambdaFunctionArn:
+    Description: "ARN of the Lambda Function"
+    Value: !GetAtt LambdaFunction.Arn
+  ScheduledRuleArn:
+    Description: "ARN of the Scheduled Rule"
+    Value: !GetAtt ScheduledRule.Arn
