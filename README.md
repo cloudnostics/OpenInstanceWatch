@@ -6,9 +6,10 @@ Receive an email once a day with a list of all your EC2 and RDS instances in all
 ## Architecture
 
 The architecture of the solution is based on the following components:
-1. Lambda function to list all EC2 and RDS instances in all regions
-2. SNS topic to send the list of instances to the subscribers
-3. Scheduled EventBridge Event Rule to trigger the Lambda function once a day
+* Lambda function to list all EC2 and RDS instances in all regions, currently a python function using the python v3.13 runtime.
+* Lambda execution role.
+* An SNS topic to send the list of instances to the subscribers
+* Scheduled EventBridge Event Rule to trigger the Lambda function once a day
 
 ## Installation
 
