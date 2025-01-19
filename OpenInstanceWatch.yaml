@@ -1,5 +1,8 @@
 AWSTemplateFormatVersion: '2010-09-09'
-Description: 'CloudFormation template for OpenInstanceWatch including EC2 and RDS instances (Version 1.0, ARM64)'
+Description: > 
+  CloudFormation template for OpenInstanceWatch Daily Report
+  listing EC2 and RDS instances (Version 1.5.1)
+  Copyright (c) 2024 Dean Layton-James
 
 Parameters:
   EmailAddress:
