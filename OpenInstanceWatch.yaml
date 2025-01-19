@@ -1,8 +1,8 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Description: > 
   CloudFormation template for OpenInstanceWatch Daily Report
-  listing EC2 and RDS instances (Version 1.5.4)
-  Copyright (c) 2024 Dean Layton-James
+  listing EC2 and RDS instances (Version 1.5.5)
+  Copyright (c) 2025 Dean Layton-James
 
 Parameters:
   EmailAddress:
@@ -235,7 +235,7 @@ Resources:
     Type: AWS::Lambda::Version
     Properties:
       FunctionName: !Ref LambdaFunction
-      Description: 'Version 1.5.4'
+      Description: 'Version 1.5.5'
 
   LambdaAlias:
     Type: AWS::Lambda::Alias
