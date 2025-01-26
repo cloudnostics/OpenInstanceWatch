@@ -39,6 +39,17 @@ Resources:
         - Key: 'Name'
           Value: !Sub '${AWS::StackName}-DailyReportTopic'
 
+  SNSTopicParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/${AWS::StackName}/SNS_TOPIC_ARN'
+      Type: SecureString
+      Value: !Ref SNSTopic
+      Description: 'SNS Topic ARN for OpenInstanceWatch'
+      Tags:
+        - Key: 'Name'
+          Value: !Sub '${AWS::StackName}-SNS_TOPIC_ARN'
+
   LambdaExecutionRole:
     Type: AWS::IAM::Role
     Properties:
@@ -56,6 +67,10 @@ Resources:
           PolicyDocument:
             Version: '2012-10-17'
             Statement:
+              - Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                Resource: !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${AWS::StackName}/SNS_TOPIC_ARN'
               - Effect: Allow
                 Action:
                   - ec2:DescribeRegions
@@ -101,7 +116,7 @@ Resources:
       Timeout: 300
       Environment:
         Variables:
-          SNS_TOPIC_ARN: !Ref SNSTopic
+          AWS_STACK_NAME: !Ref 'AWS::StackName'
           LOG_LEVEL: INFO
       Tags:
         - Key: 'Name'
@@ -123,6 +138,13 @@ Resources:
           # Create AWS SDK clients outside the handler function
           ec2_client = boto3.client('ec2')
           sns_client = boto3.client('sns')
+          ssm_client = boto3.client('ssm')
+          
+          def get_sns_topic_arn() -> str:
+              response = ssm_client.get_parameter(
+                  Name=f"/{os.environ['AWS_STACK_NAME']}/SNS_TOPIC_ARN", WithDecryption=True
+              )
+              return response['Parameter']['Value']
 
           # Get EC2, RDS, ElastiCache instances, ECS clusters and tasks, EKS clusters and nodes for a specific region
           def get_instances_for_region(region: str) -> Dict[str, List[Dict[str, Any]]]:
@@ -247,6 +269,9 @@ Resources:
           # Lambda Handler
           def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
               try:
+                  # Get the SNS topic ARN
+                  sns_topic_arn = get_sns_topic_arn()
+          
                   # Get all regions
                   regions = [region['RegionName'] for region in ec2_client.describe_regions()['Regions']]
 
@@ -295,8 +320,8 @@ Resources:
 
                   # Publish to SNS
                   sns_client.publish(
-                      TopicArn=os.environ['SNS_TOPIC_ARN'],
-                      Subject=current_date + ' OpenInstanceWatch Daily Report for AWS Account ' + accountid,
+                      TopicArn=sns_topic_arn,
+                      Subject=current_date + ' Open Instance Watch Daily Report for AWS Account ' + accountid,
                       Message=message
                   )
 
