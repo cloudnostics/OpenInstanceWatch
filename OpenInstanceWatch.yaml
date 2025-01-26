@@ -1,5 +1,5 @@
 AWSTemplateFormatVersion: '2010-09-09'
-Description: > 
+Description: >
   CloudFormation template for OpenInstanceWatch Daily Report
   listing EC2 and RDS instances (Version 1.5.5)
   Copyright (c) 2025 Dean Layton-James
@@ -60,7 +60,26 @@ Resources:
                 Action:
                   - ec2:DescribeRegions
                   - ec2:DescribeInstances
+                Resource: '*'
+              - Effect: Allow
+                Action:
                   - rds:DescribeDBInstances
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - elasticache:DescribeCacheClusters
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - ecs:ListClusters
+                  - ecs:ListTasks
+                  - ecs:DescribeTasks
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - eks:ListClusters
+                  - eks:ListNodegroups
+                  - eks:DescribeNodegroup
                 Resource: '*'
               - Effect: Allow
                 Action: sns:Publish
@@ -96,25 +115,28 @@ Resources:
           from concurrent.futures import ThreadPoolExecutor
           from typing import Dict, List, Any
           from datetime import datetime, timezone
-          
+
           # Configure logging
           logger = logging.getLogger()
           logger.setLevel(os.environ.get('LOG_LEVEL', 'INFO'))
-          
+
           # Create AWS SDK clients outside the handler function
           ec2_client = boto3.client('ec2')
           sns_client = boto3.client('sns')
 
-          # Get EC2 and RDS instances for a specific region
+          # Get EC2, RDS, ElastiCache instances, ECS clusters and tasks, EKS clusters and nodes for a specific region
           def get_instances_for_region(region: str) -> Dict[str, List[Dict[str, Any]]]:
-              """Get EC2 and RDS instances for a specific region."""
+              """Get EC2, RDS, ElastiCache instances, ECS clusters and tasks, EKS clusters and nodes for a specific region."""
               try:
                   # Create the service clients
                   ec2 = boto3.client('ec2', region_name=region)
                   rds = boto3.client('rds', region_name=region)
-          
-                  region_data = {'EC2': [ ], 'RDS': [ ] }
-          
+                  elasticache = boto3.client('elasticache', region_name=region)
+                  ecs = boto3.client('ecs', region_name=region)
+                  eks = boto3.client('eks', region_name=region)
+
+                  region_data = {'EC2': [], 'RDS': [], 'ElastiCache': [], 'ECS': [], 'EKS': []}
+
                   # Get EC2 instances
                   paginator = ec2.get_paginator('describe_instances')
                   for page in paginator.paginate():
@@ -126,106 +148,165 @@ Resources:
                                   'InstanceType': instance['InstanceType'],
                                   'State': instance['State']['Name']
                               })
-          
+
                   # Get RDS instances
                   paginator = rds.get_paginator('describe_db_instances')
                   for page in paginator.paginate():
                       for instance in page['DBInstances']:
                           region_data['RDS'].append({
-                            'Region': region,
-                            'DBInstanceIdentifier': instance['DBInstanceIdentifier'],
-                            'Engine': instance['Engine'],
-                            'DBInstanceClass': instance['DBInstanceClass'],
-                            'DBInstanceStatus': instance['DBInstanceStatus']
+                              'Region': region,
+                              'DBInstanceIdentifier': instance['DBInstanceIdentifier'],
+                              'Engine': instance['Engine'],
+                              'DBInstanceClass': instance['DBInstanceClass'],
+                              'DBInstanceStatus': instance['DBInstanceStatus']
                           })
-          
+
+                  # Get ElastiCache instances
+                  paginator = elasticache.get_paginator('describe_cache_clusters')
+                  for page in paginator.paginate():
+                      for cluster in page['CacheClusters']:
+                          region_data['ElastiCache'].append({
+                              'Region': region,
+                              'CacheClusterId': cluster['CacheClusterId'],
+                              'Engine': cluster['Engine'],
+                              'CacheNodeType': cluster['CacheNodeType'],
+                              'CacheClusterStatus': cluster['CacheClusterStatus']
+                          })
+
+                  # Get ECS clusters and tasks
+                  clusters = ecs.list_clusters()['clusterArns']
+                  for cluster_arn in clusters:
+                      cluster_name = cluster_arn.split('/')[-1]
+                      region_data['ECS'].append({
+                          'Region': region,
+                          'ClusterName': cluster_name,
+                          'ClusterArn': cluster_arn
+                      })
+                      tasks = ecs.list_tasks(cluster=cluster_arn)['taskArns']
+                      for task_arn in tasks:
+                          task = ecs.describe_tasks(cluster=cluster_arn, tasks=[task_arn])['tasks'][0]
+                          region_data['ECS'].append({
+                              'Region': region,
+                              'ClusterName': cluster_name,
+                              'TaskArn': task_arn,
+                              'TaskDefinitionArn': task['taskDefinitionArn'],
+                              'LastStatus': task['lastStatus']
+                          })
+
+                  # Get EKS clusters and nodes
+                  eks_clusters = eks.list_clusters()['clusters']
+                  for cluster_name in eks_clusters:
+                      region_data['EKS'].append({
+                          'Region': region,
+                          'ClusterName': cluster_name
+                      })
+                      nodegroups = eks.list_nodegroups(clusterName=cluster_name)['nodegroups']
+                      for nodegroup_name in nodegroups:
+                          nodegroup = eks.describe_nodegroup(clusterName=cluster_name, nodegroupName=nodegroup_name)['nodegroup']
+                          region_data['EKS'].append({
+                              'Region': region,
+                              'ClusterName': cluster_name,
+                              'NodeGroupName': nodegroup_name,
+                              'NodeGroupStatus': nodegroup['status']
+                          })
+
                   return region_data
               except Exception as e:
-                  logger.error(f"Error processing region {region}: { str(e) }")
-                  return {'EC2': [], 'RDS': []}
-          
+                  logger.error(f"Error processing region {region}: {str(e)}")
+                  return {'EC2': [], 'RDS': [], 'ElastiCache': [], 'ECS': [], 'EKS': []}
+
           # JSON to Markdown Table
           def instances_to_markdown_table(instances):
               if not instances:
                   return "No instances found."
-          
+
               # Extract headers from the first instance
               headers = list(instances[0].keys())
-          
+
               # Calculate the maximum width for each column
               col_widths = {header: len(header) for header in headers}
               for instance in instances:
                   for header in headers:
-                    col_widths[header] = max(col_widths[header], len(str(instance.get(header, ""))))
-          
+                      col_widths[header] = max(col_widths[header], len(str(instance.get(header, ""))))
+
               # Add padding to match the longest column value
               for header in headers:
                   col_widths[header] += 2  # Add padding
-              # max_width = max(col_widths.values())
-              # col_widths = {header: max_width for header in headers}
-          
+
               # Create the table header
               markdown = "| " + " | ".join(header.center(col_widths[header]) for header in headers) + " |\n"
               markdown += "| " + " | ".join("-" * col_widths[header] for header in headers) + " |\n"
-          
+
               # Add rows to the table
               for instance in instances:
                   row = "| " + " | ".join(str(instance.get(header, "")).center(col_widths[header]) for header in headers) + " |"
                   markdown += row + "\n"
-          
+
               return markdown
-          
+
           # Lambda Handler
           def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
               try:
                   # Get all regions
                   regions = [region['RegionName'] for region in ec2_client.describe_regions()['Regions']]
-          
+
                   # Process regions in parallel
-                  instance_data = {'EC2': [ ], 'RDS': [ ] }
+                  instance_data = {'EC2': [], 'RDS': [], 'ElastiCache': [], 'ECS': [], 'EKS': []}
                   with ThreadPoolExecutor(max_workers=10) as executor:
                       results = list(executor.map(get_instances_for_region, regions))
-          
+
                       for result in results:
-                        instance_data['EC2'].extend(result['EC2'])
-                        instance_data['RDS'].extend(result['RDS'])
-          
+                          instance_data['EC2'].extend(result['EC2'])
+                          instance_data['RDS'].extend(result['RDS'])
+                          instance_data['ElastiCache'].extend(result['ElastiCache'])
+                          instance_data['ECS'].extend(result['ECS'])
+                          instance_data['EKS'].extend(result['EKS'])
+
                   # Add summary information
                   instance_summary = [{
                       'Total EC2': len(instance_data['EC2']),
                       'Total RDS': len(instance_data['RDS']),
+                      'Total ElastiCache': len(instance_data['ElastiCache']),
+                      'Total ECS': len(instance_data['ECS']),
+                      'Total EKS': len(instance_data['EKS']),
                       'Regions Scanned': len(regions)
                   }]
-          
+
                   # Convert the data to a text message
                   message = ("Summary\n"
-                            + instances_to_markdown_table(instance_summary)
-                            + "\n\nEC2 Instances\n"
-                            + instances_to_markdown_table(instance_data['EC2'])
-                            + "\n\nRDS Instances\n"
-                            + instances_to_markdown_table(instance_data['RDS'])
-                            )
-          
+                             + instances_to_markdown_table(instance_summary)
+                             + "\n\nEC2 Instances\n"
+                             + instances_to_markdown_table(instance_data['EC2'])
+                             + "\n\nRDS Instances\n"
+                             + instances_to_markdown_table(instance_data['RDS'])
+                             + "\n\nElastiCache Instances\n"
+                             + instances_to_markdown_table(instance_data['ElastiCache'])
+                             + "\n\nECS Clusters and Tasks\n"
+                             + instances_to_markdown_table(instance_data['ECS'])
+                             + "\n\nEKS Clusters and Nodes\n"
+                             + instances_to_markdown_table(instance_data['EKS'])
+                             )
+
                   # Get the AWS account ID
                   accountid = context.invoked_function_arn.split(":")[4]
-          
+
                   # Current date as YYYY-MM-DD
                   current_date = datetime.now(timezone.utc).strftime('%Y-%m-%d')
-          
+
                   # Publish to SNS
                   sns_client.publish(
                       TopicArn=os.environ['SNS_TOPIC_ARN'],
                       Subject=current_date + ' OpenInstanceWatch Daily Report for AWS Account ' + accountid,
                       Message=message
                   )
-          
+
                   logger.info(f"Report generated and sent successfully")
                   return {
-                    'statusCode': 200,
-                    'body': 'Report generated and sent successfully'
+                      'statusCode': 200,
+                      'body': 'Report generated and sent successfully'
                   }
               except Exception as e:
-                  logger.error(f"Error in handler: { str(e) }")
+                  logger.error(f"Error in handler: {str(e)}")
                   return {
                       'statusCode': 500,
                       'body': 'An error occurred'
